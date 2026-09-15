@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import random
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -12,8 +14,9 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from statsmodels.stats.diagnostic import acorr_ljungbox
+from scipy import stats as scipy_stats
 from statsmodels.tsa.ar_model import AutoReg
+from statsmodels.tsa.stattools import acf
 from torch.utils.data import DataLoader, Dataset
 
 SEED = 42
@@ -21,6 +24,8 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 
 
 def load_csv_data(path: Path) -> tuple[pd.DataFrame, dict[str, int]]:
@@ -73,12 +78,26 @@ def create_sequences(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     data = frame[feature_cols].to_numpy(dtype=np.float32)
     target = frame[target_col].to_numpy(dtype=np.float32)
-    X, y, indices = [], [], []
-    for i in range(seq_len - 1, len(frame)):
-        X.append(data[i - seq_len + 1 : i + 1])
-        y.append(target[i])
-        indices.append(i)
-    return np.asarray(X), np.asarray(y), np.asarray(indices)
+    X = np.lib.stride_tricks.sliding_window_view(data, seq_len, axis=0).transpose(0, 2, 1)
+    y = target[seq_len - 1 :]
+    indices = np.arange(seq_len - 1, len(target))
+    return X, y, indices
+
+
+def _load_file(args: tuple[Path, list[str]]) -> tuple[str, np.ndarray, np.ndarray, np.ndarray, dict, int]:
+    """Load, validate, featurize, and per-file normalize a single export."""
+    path, feature_cols = args
+    data, file_quality = load_csv_data(path)
+    frame = make_features(data)
+    n = len(frame)
+    train_end = int(n * 0.8)
+    stats = frame.iloc[:train_end][feature_cols]
+    mean = stats.mean().to_numpy(dtype=np.float64)
+    std = stats.std().replace(0, 1.0).to_numpy(dtype=np.float64)
+    feats = (frame[feature_cols].to_numpy(dtype=np.float32) - mean) / std
+    target = frame["target"].to_numpy(dtype=np.float32)
+    log_ret = frame["log_ret"].to_numpy(dtype=np.float32)
+    return path.name, feats, target, log_ret, file_quality, n
 
 
 class TimeSeriesDataset(Dataset):
@@ -150,30 +169,45 @@ def train_model(
     epochs: int,
     patience: int,
     learning_rate: float = 1e-3,
+    use_amp: bool = True,
+    use_compile: bool = False,
 ) -> CNNLSTM:
+    if use_compile:
+        try:
+            model = torch.compile(model)
+        except Exception as exc:  # fall back to eager if compile is unavailable
+            print(f"torch.compile failed ({exc}); continuing in eager mode")
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=5
     )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp and DEVICE.type == "cuda")
+    autocast = torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_amp and DEVICE.type == "cuda")
     best_val, best_state, wait = float("inf"), None, 0
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss = 0.0
         for X, y in train_loader:
-            X, y = X.to(DEVICE), y.to(DEVICE)
-            optimizer.zero_grad()
-            loss = gaussian_nll(*model(X), y)
-            loss.backward()
+            X, y = X.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+            optimizer.zero_grad(set_to_none=True)
+            with autocast:
+                mu, logvar = model(X)
+                loss = gaussian_nll(mu, logvar, y)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            train_loss += loss.item() * len(X)
-        train_loss /= len(train_loader.dataset)
+            scaler.step(optimizer)
+            scaler.update()
+            train_loss += loss.detach() * len(X)
+        train_loss = (train_loss / len(train_loader.dataset)).item()
         model.eval()
         val_loss = 0.0
         with torch.no_grad():
             for X, y in val_loader:
-                val_loss += gaussian_nll(*model(X.to(DEVICE)), y.to(DEVICE)).item() * len(X)
-        val_loss /= len(val_loader.dataset)
+                X, y = X.to(DEVICE, non_blocking=True), y.to(DEVICE, non_blocking=True)
+                with autocast:
+                    val_loss += gaussian_nll(*model(X), y).detach() * len(X)
+        val_loss = (val_loss / len(val_loader.dataset)).item()
         scheduler.step(val_loss)
         if val_loss < best_val:
             best_val = val_loss
@@ -309,74 +343,77 @@ def scan_parameters(
     return best
 
 
+def ljung_box_fft(residuals, lags=(10, 20)):
+    """Ljung-Box test using FFT-based ACF (avoids O(n^2) autocorrelation)."""
+    residuals = np.asarray(residuals, dtype=float)
+    nobs = residuals.shape[0]
+    lags = np.atleast_1d(lags).astype(int)
+    maxlag = int(lags.max())
+    sacf = acf(residuals, nlags=maxlag, fft=True)
+    sacf2 = sacf[1 : maxlag + 1] ** 2 / (nobs - np.arange(1, maxlag + 1))
+    q_stat = nobs * (nobs + 2) * np.cumsum(sacf2)[lags - 1]
+    pvals = scipy_stats.chi2.sf(q_stat, lags)
+    return pd.DataFrame({"lb_stat": q_stat, "lb_pvalue": pvals}, index=lags)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", type=Path, default=Path("."))
+    parser.add_argument("--data", type=Path, default=Path("20260914_A"))
     parser.add_argument("--seq-len", type=int, default=30)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=12)
     parser.add_argument("--ar-lags", type=int, default=10)
-    parser.add_argument("--max-train-windows", type=int, default=64)
-    parser.add_argument("--max-test-windows", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=4096)
+    parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--load-workers", type=int, default=None)
+    parser.add_argument("--cnn-channels", type=int, default=32)
+    parser.add_argument("--hidden-size", type=int, default=32)
+    parser.add_argument("--num-layers", type=int, default=1)
+    parser.add_argument("--amp", action="store_true", default=True)
+    parser.add_argument("--no-amp", dest="amp", action="store_false")
+    parser.add_argument("--compile", action="store_true", default=False)
     args = parser.parse_args()
     feature_cols = ["log_ret", "vol_chg", "roll_vol_5", "roll_vol_20"]
     config = {
         "seq_len": args.seq_len,
-        "cnn_channels": 32,
-        "hidden_size": 32,
-        "num_layers": 1,
+        "cnn_channels": args.cnn_channels,
+        "hidden_size": args.hidden_size,
+        "num_layers": args.num_layers,
         "dropout": 0.3,
         "learning_rate": 5e-4,
-        "batch_size": 64,
+        "batch_size": args.batch_size,
     }
     paths = sorted(args.data.glob("*.txt")) if args.data.is_dir() else [args.data]
     if not paths:
         raise FileNotFoundError("No .txt stock data files found")
-    datasets, quality = [], []
-    for path in paths:
-        data, file_quality = load_csv_data(path)
-        frame = make_features(data)
-        frame["symbol"] = path.stem
-        datasets.append(frame)
-        quality.append((path.name, file_quality, len(frame)))
+    load_workers = args.load_workers or min(64, os.cpu_count() or 1)
+    seq_len = config["seq_len"]
     train_parts, val_parts, test_parts = [], [], []
     ar_parts = []
-    for frame in datasets:
-        train_end = int(len(frame) * 0.8)
-        stats = frame.iloc[:train_end][feature_cols]
-        normalized = frame.copy()
-        normalized[feature_cols] = (frame[feature_cols] - stats.mean()) / stats.std().replace(0, 1.0)
-        X, y, indices = create_sequences(normalized, feature_cols, "target", config["seq_len"])
-        train_mask = indices < train_end
-        val_size = max(1, int(train_mask.sum() * 0.1))
-        if train_mask.sum() <= val_size or (~train_mask).sum() == 0:
-            continue
-        train_X, train_y = X[train_mask][:-val_size], y[train_mask][:-val_size]
-        if len(train_X) > args.max_train_windows:
-            selected = np.linspace(
-                0, len(train_X) - 1, args.max_train_windows, dtype=int
-            )
-            train_X, train_y = train_X[selected], train_y[selected]
-        val_X, val_y = X[train_mask][-val_size:], y[train_mask][-val_size:]
-        if len(val_X) > max(16, args.max_train_windows // 4):
-            selected = np.linspace(
-                0, len(val_X) - 1, max(16, args.max_train_windows // 4), dtype=int
-            )
-            val_X, val_y = val_X[selected], val_y[selected]
-        train_parts.append((train_X, train_y))
-        val_parts.append((val_X, val_y))
-        test_mask = indices >= train_end
-        test_X, test_y = X[test_mask], y[test_mask]
-        test_indices = indices[test_mask]
-        if len(test_X) > args.max_test_windows:
-            selected = np.linspace(
-                0, len(test_X) - 1, args.max_test_windows, dtype=int
-            )
-            test_X, test_y, test_indices = (
-                test_X[selected], test_y[selected], test_indices[selected]
-            )
-        test_parts.append((test_X, test_y, test_indices, frame, train_end))
-        ar_parts.append((frame.iloc[:train_end]["log_ret"].to_numpy(), frame, indices[test_mask]))
+    quality = []
+    with ProcessPoolExecutor(max_workers=load_workers) as pool:
+        for name, feats, target, log_ret, file_quality, n in pool.map(
+            _load_file, [(path, feature_cols) for path in paths], chunksize=8
+        ):
+            quality.append((name, file_quality, n))
+            if n <= seq_len:
+                continue
+            train_end = int(n * 0.8)
+            X = np.lib.stride_tricks.sliding_window_view(feats, seq_len, axis=0).transpose(0, 2, 1)
+            y = target[seq_len - 1 :]
+            indices = np.arange(seq_len - 1, n)
+            train_mask = indices < train_end
+            val_size = max(1, int(train_mask.sum() * 0.1))
+            if train_mask.sum() <= val_size or (~train_mask).sum() == 0:
+                continue
+            train_X, train_y = X[train_mask][:-val_size], y[train_mask][:-val_size]
+            val_X, val_y = X[train_mask][-val_size:], y[train_mask][-val_size:]
+            train_parts.append((train_X, train_y))
+            val_parts.append((val_X, val_y))
+            test_mask = indices >= train_end
+            test_parts.append((X[test_mask], y[test_mask]))
+            test_indices = indices[test_mask]
+            ar_parts.append((log_ret[:train_end], log_ret, target, test_indices))
     X_train = np.concatenate([part[0] for part in train_parts])
     y_train = np.concatenate([part[1] for part in train_parts])
     X_val = np.concatenate([part[0] for part in val_parts])
@@ -387,12 +424,24 @@ def main() -> None:
         TimeSeriesDataset(X_train, y_train),
         config["batch_size"],
         shuffle=True,
+        num_workers=args.workers,
+        pin_memory=True,
+        persistent_workers=args.workers > 0,
+        prefetch_factor=4,
+        drop_last=True,
     )
     val_loader = DataLoader(
         TimeSeriesDataset(X_val, y_val),
         config["batch_size"],
+        num_workers=args.workers,
+        pin_memory=True,
     )
-    test_loader = DataLoader(TimeSeriesDataset(X_test, y_test), config["batch_size"])
+    test_loader = DataLoader(
+        TimeSeriesDataset(X_test, y_test),
+        config["batch_size"],
+        num_workers=args.workers,
+        pin_memory=True,
+    )
     torch.manual_seed(SEED)
     model = CNNLSTM(
         len(feature_cols),
@@ -403,7 +452,7 @@ def main() -> None:
     ).to(DEVICE)
     model = train_model(
         model, train_loader, val_loader, args.epochs, args.patience,
-        config["learning_rate"],
+        config["learning_rate"], use_amp=args.amp, use_compile=args.compile,
     )
     mu, logvar, y_true = predict(model, test_loader)
     sigma2 = np.exp(logvar)
@@ -433,14 +482,14 @@ def main() -> None:
     print(f"Buy-and-hold annualized return: {buy_hold_growth ** (1.0 / test_years) - 1.0:.2%}")
     log_likelihood = -0.5 * np.sum(np.log(2 * np.pi * sigma2) + (y_true - mu) ** 2 / sigma2)
     ar_preds_parts, ar_true_parts = [], []
-    for train_ret, frame, test_indices in ar_parts:
+    for train_ret, log_ret, target, test_indices in ar_parts:
         ar_model = AutoReg(train_ret, lags=args.ar_lags).fit()
         const, phis = float(ar_model.params[0]), np.asarray(ar_model.params[1:])
         ar_preds_parts.append(np.asarray([
-            ar_predict(frame.iloc[:i + 1]["log_ret"].to_numpy(), const, phis)
+            ar_predict(log_ret[:i + 1], const, phis)
             for i in test_indices
         ]))
-        ar_true_parts.append(frame.iloc[test_indices]["target"].to_numpy())
+        ar_true_parts.append(target[test_indices])
     ar_preds = np.concatenate(ar_preds_parts)
     ar_true = np.concatenate(ar_true_parts)
     ar_var = np.var(np.concatenate([part[0] for part in ar_parts]), ddof=1)
@@ -460,9 +509,9 @@ def main() -> None:
     print(f"Reference LR: {2 * (log_likelihood - ar_log_likelihood):.4f}")
     print("\n========== Ljung-Box residual test ==========")
     print("CNN-LSTM residuals:")
-    print(acorr_ljungbox(y_true - mu, lags=[10, 20], return_df=True))
+    print(ljung_box_fft(y_true - mu, lags=[10, 20]))
     print("\nAR residuals:")
-    print(acorr_ljungbox(ar_true - ar_preds, lags=[10, 20], return_df=True))
+    print(ljung_box_fft(ar_true - ar_preds, lags=[10, 20]))
 
 
 if __name__ == "__main__":
