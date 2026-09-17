@@ -1,0 +1,34 @@
+Epoch 001 | train NLL -1.845150 | val NLL -1.930403
+Epoch 010 | train NLL -1.888262 | val NLL -1.928111
+Early stopping at epoch 12, best val NLL = -1.932975
+
+========== Long-only trading backtest ==========
+Rule: invest next day when predicted log return > 0; otherwise hold cash
+Assumptions: no fees, slippage, taxes, or position-size limits
+Strategy cumulative return: 4.11%
+Strategy annualized return: 4.59%
+Invested days: 1104686/1246342
+Position changes: 100585
+Buy-and-hold cumulative return: 0.56%
+Buy-and-hold annualized return: 0.63%
+Device: cuda
+Files: 5571 | valid rows: 6331158 | invalid rows: 5574
+Train samples: 4330353 | validation samples: 477387 | test samples: 1246342
+
+========== Test likelihood comparison ==========
+CNN-LSTM average NLL: -1.870240
+AR(10) average NLL: -2.004858
+CNN-LSTM total logL: 2330959.2500
+AR total logL: 2498738.6402
+Reference LR: -335558.7804
+
+========== Ljung-Box residual test ==========
+CNN-LSTM residuals:
+        lb_stat  lb_pvalue
+10  5737.303439        0.0
+20  7869.812624        0.0
+
+AR residuals:
+         lb_stat  lb_pvalue
+10   6922.107848        0.0
+20  10051.458910        0.0
